@@ -42,19 +42,55 @@ def handler(event):
 
 
 def _run_pyannote(audio_path, settings):
+    """Run pyannote diarization. Loads from local cache first (no token
+    required when the model was baked into the image at build time).
+    Falls back to authenticated download if cache is empty. Logs every
+    branch so worker logs explain why we end up with empty turns."""
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-    if not token:
-        return []
     model = settings.get("pyannote_model") or os.environ.get(
         "PYANNOTE_MODEL", "pyannote/speaker-diarization-3.1"
     )
-    from pyannote.audio import Pipeline
+    try:
+        from pyannote.audio import Pipeline
+    except Exception as exc:
+        print(f"[pyannote] FATAL: cannot import pyannote.audio: {exc}", flush=True)
+        return []
+
+    pipeline = None
+
+    # Attempt 1: load with token (newer arg name)
+    if token:
+        try:
+            pipeline = Pipeline.from_pretrained(model, token=token)
+            print(f"[pyannote] loaded model={model} with HF_TOKEN", flush=True)
+        except TypeError:
+            try:
+                pipeline = Pipeline.from_pretrained(model, use_auth_token=token)
+                print(f"[pyannote] loaded model={model} with use_auth_token", flush=True)
+            except Exception as exc:
+                print(f"[pyannote] auth-load failed: {exc}", flush=True)
+                pipeline = None
+        except Exception as exc:
+            print(f"[pyannote] token-load failed: {exc}", flush=True)
+            pipeline = None
+
+    # Attempt 2: load WITHOUT token. Works when the model was baked into
+    # the image at build time (Dockerfile pre-warm) — HF cache is local,
+    # no auth needed.
+    if pipeline is None:
+        try:
+            pipeline = Pipeline.from_pretrained(model)
+            print(f"[pyannote] loaded model={model} from local cache (no token needed)", flush=True)
+        except Exception as exc:
+            print(f"[pyannote] FATAL: model load failed both with and without token: {exc}", flush=True)
+            return []
 
     try:
-        pipeline = Pipeline.from_pretrained(model, token=token)
-    except TypeError:
-        pipeline = Pipeline.from_pretrained(model, use_auth_token=token)
-    diarization = pipeline(audio_path)
+        diarization = pipeline(audio_path)
+    except Exception as exc:
+        print(f"[pyannote] FATAL: diarization run failed: {exc}", flush=True)
+        return []
+
     label_map = {}
     turns = []
     for turn, _, label in diarization.itertracks(yield_label=True):
@@ -67,6 +103,7 @@ def _run_pyannote(audio_path, settings):
                 "audio_speaker_id": label_map[label],
             }
         )
+    print(f"[pyannote] returning {len(turns)} turns, {len(label_map)} unique speakers", flush=True)
     return turns
 
 
