@@ -11,9 +11,163 @@ import runpod
 
 SAMPLE_RATE = 16000
 
+# ── Embedding mode imports (lazy, only when mode=speaker_embedding) ─
+_embedding_classifier = None
+
+def _get_embedding_classifier():
+    global _embedding_classifier
+    if _embedding_classifier is None:
+        import functools, torch
+        if not hasattr(torch.amp, 'custom_fwd'):
+            def _fake_custom_fwd(fwd=None, device_type=None, cast_inputs=None):
+                if fwd is None:
+                    def deco(func):
+                        @functools.wraps(func)
+                        def w(*a, **k): return func(*a, **k)
+                        return w
+                    return deco
+                else:
+                    @functools.wraps(fwd)
+                    def w(*a, **k): return fwd(*a, **k)
+                    return w
+            torch.amp.custom_fwd = _fake_custom_fwd
+            torch.amp.custom_bwd = _fake_custom_fwd
+
+        from speechbrain.inference.speaker import EncoderClassifier
+        import torchaudio
+        print("[embedding] Loading ECAPA-TDNN...", flush=True)
+        _embedding_classifier = EncoderClassifier.from_hparams(
+            source="speechbrain/spkrec-ecapa-voxceleb",
+            savedir="/tmp/ecapa_model",
+            run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"},
+        )
+        print("[embedding] ECAPA loaded", flush=True)
+    return _embedding_classifier
+
+
+def _handle_embedding(data):
+    """Handle mode=speaker_embedding: compute ECAPA embeddings and similarities."""
+    import numpy as np, time, base64, tempfile, os, torch, torchaudio
+
+    classifier = _get_embedding_classifier()
+    device = next(classifier.mods.parameters()).device
+    t_start = time.time()
+
+    audio_b64 = data["audio_b64"]
+    references = data.get("references") or []
+    candidates = data.get("candidates") or []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audio_path = os.path.join(tmp, "audio.wav")
+        with open(audio_path, "wb") as f:
+            f.write(base64.b64decode(audio_b64))
+
+        waveform, sr = torchaudio.load(audio_path)
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
+
+        print(f"[embedding] Audio: {list(waveform.shape)} @ {sr}Hz, device={device}",
+              flush=True)
+
+        def extract_clip(ws, sr, start_ms, end_ms):
+            ss = int(start_ms * sr / 1000)
+            es = int(end_ms * sr / 1000)
+            if es > ws.shape[1]: es = ws.shape[1]
+            if ss >= es or (es - ss) < 8000:  # min 0.5s at 16kHz
+                return None
+            clip = ws[:, ss:es]
+            if sr != 16000:
+                clip = torchaudio.functional.resample(clip, sr, 16000)
+            return clip
+
+        # Smoke-test with a 4s clip
+        test_clip = extract_clip(waveform, sr, 1000, 5000)
+        if test_clip is not None:
+            test_clip = test_clip.to(device)
+            with torch.no_grad():
+                t0 = time.time()
+                test_emb = classifier.encode_batch(test_clip.unsqueeze(0))
+                enc_ms = (time.time() - t0) * 1000
+            print(f"[embedding] Smoke: input={list(test_clip.shape)} "
+                  f"output={list(test_emb.shape)} time={enc_ms:.0f}ms device={device}",
+                  flush=True)
+
+        # Reference embeddings
+        ref_embeddings = {}
+        for ref in references:
+            char = ref["character"]
+            segments = ref.get("segments") or []
+            embs = []
+            for seg in segments:
+                clip = extract_clip(waveform, sr, seg["start_ms"], seg["end_ms"])
+                if clip is None: continue
+                clip = clip.to(device)
+                with torch.no_grad():
+                    emb = classifier.encode_batch(clip.unsqueeze(0))
+                embs.append(emb.squeeze().cpu().numpy())
+            if embs:
+                ref_embeddings[char] = {
+                    "mean": np.mean(embs, axis=0),
+                    "count": len(embs),
+                }
+
+        # Score candidates
+        def cos_sim(a, b):
+            a = a.flatten(); b = b.flatten()
+            return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+        results = []
+        for cand in candidates:
+            clip = extract_clip(waveform, sr, cand["start_ms"], cand["end_ms"])
+            if clip is None:
+                results.append({"index": cand["index"], "error": "clip_too_short"})
+                continue
+            clip = clip.to(device)
+            with torch.no_grad():
+                emb = classifier.encode_batch(clip.unsqueeze(0))
+            emb = emb.squeeze().cpu().numpy()
+
+            scores = {}
+            for char, ref in ref_embeddings.items():
+                scores[char] = cos_sim(emb, ref["mean"])
+
+            sorted_chars = sorted(scores.items(), key=lambda x: -x[1])
+            best = sorted_chars[0]
+            second = sorted_chars[1] if len(sorted_chars) > 1 else ("", 0.0)
+
+            results.append({
+                "index": cand["index"],
+                "similarities": {ch: round(s, 6) for ch, s in scores.items()},
+                "best_match": best[0],
+                "best_score": round(best[1], 6),
+                "second_match": second[0],
+                "second_score": round(second[1], 6),
+                "margin": round(best[1] - second[1], 6),
+            })
+
+    elapsed = time.time() - t_start
+    print(f"[embedding] Done: {len(candidates)} candidates in {elapsed:.1f}s", flush=True)
+    return {
+        "ok": True, "mode": "speaker_embedding",
+        "device": str(device), "processing_time_s": round(elapsed, 3),
+        "reference_embeddings": {ch: {"count": rd["count"]} for ch, rd in ref_embeddings.items()},
+        "candidates": results,
+    }
+
 
 def handler(event):
     data = event.get("input") or {}
+
+    # ── Speaker embedding mode ──────────────────────────────────────
+    if data.get("mode") == "speaker_embedding":
+        try:
+            return _handle_embedding(data)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            return {"ok": False, "error": str(exc), "retryable": False}
+
+    # ── Standard pyannote diarization below ─────────────────────────
     try:
         audio_b64 = data["audio_b64"]
         segments = data.get("segments") or []
