@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.4.0-cuda12.4.1-devel-ubuntu22.04
 
 # OS deps for pyannote audio loading + huggingface model cache
 RUN apt-get update && apt-get install -y --no-install-recommends \

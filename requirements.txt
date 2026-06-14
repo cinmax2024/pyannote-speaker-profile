@@ -7,4 +7,4 @@ pyannote.metrics==3.2.1
 pyannote.pipeline==3.0.1
 huggingface-hub<1
 flask==3.0.3
-speechbrain==0.5.16
+speechbrain
