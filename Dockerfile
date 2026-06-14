@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.4.0-cuda12.4.1-devel-ubuntu22.04
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 # OS deps for pyannote audio loading + huggingface model cache
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -9,7 +9,7 @@ WORKDIR /app
 
 # Pre-cache python deps in their own layer for faster rebuilds
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --ignore-installed blinker -r requirements.txt
 
 # ── Pre-warm: bake the pyannote + ECAPA models into the image ──────
 ARG HF_TOKEN
