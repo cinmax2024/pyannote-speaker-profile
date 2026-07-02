@@ -169,13 +169,21 @@ def handler(event):
 
     # ── Standard pyannote diarization below ─────────────────────────
     try:
-        audio_b64 = data["audio_b64"]
         segments = data.get("segments") or []
         settings = data.get("settings") or {}
         with tempfile.TemporaryDirectory() as tmp:
             audio_path = os.path.join(tmp, "audio.wav")
-            with open(audio_path, "wb") as fh:
-                fh.write(base64.b64decode(audio_b64))
+            audio_url = data.get("audio_url")
+            if audio_url:
+                # Presigned R2 URL — movie-length WAVs exceed the JSON b64
+                # body limit.
+                import urllib.request
+                print("[diarize] Downloading audio from URL...", flush=True)
+                urllib.request.urlretrieve(audio_url, audio_path)
+                print("[diarize] Downloaded %.1f MB" % (os.path.getsize(audio_path)/1e6), flush=True)
+            else:
+                with open(audio_path, "wb") as fh:
+                    fh.write(base64.b64decode(data["audio_b64"]))
             turns = _run_pyannote(audio_path, settings)
             mixed_by_index = _mixed_speaker_marks(segments, turns, settings)
             profiled = []
